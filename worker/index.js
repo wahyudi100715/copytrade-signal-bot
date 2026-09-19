@@ -1,134 +1,204 @@
-// functions/index.js
-//
-// Cloudflare Pages Function buat rute "/" (root situs). Kalau ada
-// parameter ?ca=<alamat token> di URL, function ini manggil endpoint
-// internal /api/scan (yang udah ada di functions/api/scan.js) buat
-// ambil skor & verdict beneran, terus suntikkan ke meta tag OG/Twitter
-// sebelum HTML dikirim ke browser.
-//
-// Ini jalan di edge (server), BUKAN di browser — makanya kebaca sama
-// bot crawler X/Telegram/WhatsApp yang gak menjalankan JavaScript.
-//
-// Tanpa ?ca= di URL, function ini gak ngapa-ngapain — langsung serve
-// index.html apa adanya kayak biasa.
+const SNIPE_WINDOW_SECONDS = 180;
+const SIGNAL_EXPIRY_SECONDS = 3600;
+const ENTRY_THRESHOLD = 70;
 
-export async function onRequest(context) {
-  const { request, next } = context;
+const WEIGHTS = {
+  social: 0.30,
+  momentum: 0.30,
+  safety: 0.40,
+};
 
-  // Cuma proses request GET buat halaman HTML. Method lain (kalau ada)
-  // dan asset non-HTML lewat aja tanpa disentuh.
-  if (request.method !== 'GET') {
-    return next();
-  }
+function clip(x, lo = 0, hi = 1) {
+  return Math.max(lo, Math.min(hi, x));
+}
 
-  const url = new URL(request.url);
-  const ca = url.searchParams.get('ca');
+function socialScore(d) {
+  const mentions = d.kolMentionsCount || 0;
+  const growing = !!d.kolMentionsGrowing;
+  const base = clip(mentions / 3.0);
+  const growthBonus = growing ? 0.2 : 0.0;
+  return clip(base + growthBonus);
+}
 
-  if (!ca) {
-    return next();
-  }
+function momentumScore(d) {
+  const volNow = d.volume5minUsd || 0;
+  const volPrev = d.volumePrior5minUsd || 0;
+  const holdersNow = d.holderCount || 0;
+  const holdersPrev = d.holderCount15minAgo || 0;
 
-  const response = await next();
-  const contentType = response.headers.get('content-type') || '';
-  if (!contentType.includes('text/html')) {
-    return response;
-  }
-
-  let html = await response.text();
-  let scan = null;
-
-  // Sama seperti og-image.js: cache hasil /api/scan per-token selama
-  // 5 menit di edge, biar token yang di-share rame-rame gak nembak
-  // DexScreener berkali-kali dalam waktu singkat.
-  const cache = caches.default;
-  const cacheKey = new Request(`https://tokenscansd-og-cache.internal/scan/${ca}`);
-
-  try {
-    const cachedRes = await cache.match(cacheKey);
-    if (cachedRes) {
-      scan = await cachedRes.json();
-    } else {
-      const scanRes = await fetch(
-        `${url.origin}/api/scan?token=${encodeURIComponent(ca)}&lang=id`,
-        { cf: { cacheTtl: 0, cacheEverything: false } }
-      );
-      if (scanRes.ok) {
-        const data = await scanRes.json();
-        // scan.js selalu balikin HTTP 200 walau gagal internal (biar gak
-        // dianggap down sama health-check OKX), jadi kita cek field
-        // `error` buat tau ini beneran hasil scan atau bukan.
-        if (!data.error && data.symbol && data.symbol !== '???') {
-          scan = data;
-          const cacheResponse = new Response(JSON.stringify(data), {
-            headers: { 'content-type': 'application/json', 'cache-control': 'max-age=300' },
-          });
-          context.waitUntil(cache.put(cacheKey, cacheResponse));
-        }
-      }
-    }
-  } catch (err) {
-    // Endpoint /api/scan gagal ditembak (timeout dll) — gak masalah,
-    // fallback ke teks generik di bawah, jangan bikin request ini gagal.
-    scan = null;
-  }
-
-  const shareUrl = `${url.origin}${url.pathname}?ca=${encodeURIComponent(ca)}`;
-
-  let title, description;
-
-  if (scan) {
-    const liquidity = scan.details && scan.details.liquidity_usd
-      ? formatUsd(scan.details.liquidity_usd)
-      : null;
-
-    title = `Scan $${scan.symbol} (${scan.chain}) — Skor ${scan.score}/100 ${scan.verdict} | TokenScan SD`;
-
-    const parts = [
-      `Skor keamanan on-chain: ${scan.score}/100 (${scan.verdict}).`,
-      scan.verdict_detail || '',
-      liquidity ? `Liquidity: ${liquidity}.` : '',
-      'Data on-chain, bukan saran investasi — selalu DYOR.',
-    ].filter(Boolean);
-    description = parts.join(' ');
+  let volSignal;
+  if (volPrev <= 0) {
+    volSignal = volNow > 0 ? 0.5 : 0.0;
   } else {
-    title = 'TokenScan SD — Hasil Scan Token';
-    description = 'Cek likuiditas, distribusi holder, dan tanda-tanda rug pull untuk token ini di TokenScan SD — gratis, dalam bahasa yang gampang dimengerti.';
+    const ratio = volNow / volPrev;
+    volSignal = clip((ratio - 1.0) / 1.0);
   }
 
-  const esc = (s) => String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/"/g, '&quot;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-
-  const escTitle = esc(title);
-  const escDesc = esc(description);
-  const escUrl = esc(shareUrl);
-  const escImage = scan ? esc(`${url.origin}/og-image?ca=${encodeURIComponent(ca)}`) : null;
-
-  html = html
-    .replace(/<title>.*?<\/title>/is, `<title>${escTitle}</title>`)
-    .replace(/(<meta property="og:title" content=")[^"]*(")/i, `$1${escTitle}$2`)
-    .replace(/(<meta property="og:description" content=")[^"]*(")/i, `$1${escDesc}$2`)
-    .replace(/(<meta property="og:url" content=")[^"]*(")/i, `$1${escUrl}$2`)
-    .replace(/(<meta name="twitter:title" content=")[^"]*(")/i, `$1${escTitle}$2`)
-    .replace(/(<meta name="twitter:description" content=")[^"]*(")/i, `$1${escDesc}$2`);
-
-  if (escImage) {
-    html = html
-      .replace(/(<meta property="og:image" content=")[^"]*(")/i, `$1${escImage}$2`)
-      .replace(/(<meta name="twitter:image" content=")[^"]*(")/i, `$1${escImage}$2`);
+  let holderSignal;
+  if (holdersPrev <= 0) {
+    holderSignal = holdersNow > 0 ? 0.5 : 0.0;
+  } else {
+    const growth = (holdersNow - holdersPrev) / holdersPrev;
+    holderSignal = clip(growth / 0.20);
   }
 
-  const newResponse = new Response(html, response);
-  newResponse.headers.set('content-type', 'text/html; charset=UTF-8');
-  return newResponse;
+  return clip(0.5 * volSignal + 0.5 * holderSignal);
 }
 
-function formatUsd(n) {
-  const num = Number(n);
-  if (!Number.isFinite(num)) return null;
-  if (num >= 1e6) return `$${(num / 1e6).toFixed(2)}M`;
-  if (num >= 1e3) return `$${(num / 1e3).toFixed(1)}K`;
-  return `$${num.toFixed(0)}`;
+function safetyScore(d) {
+  if (d.rugcheckFlag) return 0.0;
+
+  const lpLocked = d.lpLocked ? 1.0 : 0.0;
+
+  const top10 = d.top10HolderPct ?? 100.0;
+  const top10Signal = clip((50.0 - top10) / 50.0);
+
+  const devPct = d.devHolderPct ?? 100.0;
+  const devSignal = clip((15.0 - devPct) / 15.0);
+
+  const goplus = clip((d.goplusRiskScore || 0) / 100.0);
+
+  const liquidity = d.liquidityUsd || 0;
+  const liqSignal = clip(liquidity / 20000.0);
+
+  return clip(
+    0.25 * lpLocked +
+    0.20 * top10Signal +
+    0.15 * devSignal +
+    0.25 * goplus +
+    0.15 * liqSignal
+  );
 }
+
+function calculateConfidenceScore(tokenData) {
+  const poolAge = tokenData.now - tokenData.poolCreatedAt;
+
+  if (poolAge < SNIPE_WINDOW_SECONDS) {
+    return {
+      total: 0,
+      breakdown: {},
+      gatedOut: true,
+      gateReason: `pool only ${poolAge.toFixed(0)}s old, below ${SNIPE_WINDOW_SECONDS}s snipe window`,
+      entryAllowed: false,
+    };
+  }
+
+  if (poolAge > SIGNAL_EXPIRY_SECONDS) {
+    return {
+      total: 0,
+      breakdown: {},
+      gatedOut: true,
+      gateReason: `pool ${poolAge.toFixed(0)}s old, past ${SIGNAL_EXPIRY_SECONDS}s signal expiry`,
+      entryAllowed: false,
+    };
+  }
+
+  if (tokenData.rugcheckFlag) {
+    return {
+      total: 0,
+      breakdown: { safety: 0 },
+      gatedOut: true,
+      gateReason: "RugCheck flagged this token",
+      entryAllowed: false,
+    };
+  }
+
+  const scores = {
+    social: socialScore(tokenData),
+    momentum: momentumScore(tokenData),
+    safety: safetyScore(tokenData),
+  };
+
+  const total =
+    (scores.social * WEIGHTS.social +
+      scores.momentum * WEIGHTS.momentum +
+      scores.safety * WEIGHTS.safety) * 100;
+
+  return {
+    total,
+    breakdown: scores,
+    gatedOut: false,
+    gateReason: "",
+    entryAllowed: total >= ENTRY_THRESHOLD,
+  };
+}
+
+async function fetchCandidateTokens(env) {
+  return [];
+}
+
+async function enrichTokenData(env, candidate) {
+  return {
+    poolCreatedAt: candidate.poolCreatedAt,
+    now: Math.floor(Date.now() / 1000),
+    kolMentionsCount: candidate.kolMentionsCount || 0,
+    kolMentionsGrowing: candidate.kolMentionsGrowing || false,
+    holderCount: 0,
+    holderCount15minAgo: 0,
+    volume5minUsd: 0,
+    volumePrior5minUsd: 0,
+    liquidityUsd: 0,
+    lpLocked: false,
+    top10HolderPct: 100,
+    devHolderPct: 100,
+    goplusRiskScore: 0,
+    rugcheckFlag: false,
+  };
+}
+
+async function executeEntry(env, tokenData, scoreResult) {
+  await notifyTelegram(
+    env,
+    `PAPER ENTRY signal - Token: ${tokenData.symbol || "?"} - Score: ${scoreResult.total.toFixed(1)} - Breakdown: ${JSON.stringify(scoreResult.breakdown)}`
+  );
+}
+
+async function notifyTelegram(env, message) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: message }),
+    });
+  } catch (err) {
+    console.error("Telegram notify failed:", err);
+  }
+}
+
+async function runScanLoop(env) {
+  const candidates = await fetchCandidateTokens(env);
+
+  for (const candidate of candidates) {
+    const seenKey = `seen:${candidate.mint}`;
+    const alreadySeen = await env.BOT_STATE.get(seenKey);
+    if (alreadySeen) continue;
+
+    const tokenData = await enrichTokenData(env, candidate);
+    const scoreResult = calculateConfidenceScore(tokenData);
+
+    await env.BOT_STATE.put(seenKey, "1", { expirationTtl: SIGNAL_EXPIRY_SECONDS + 300 });
+
+    if (scoreResult.gatedOut) {
+      console.log(`Skipped ${candidate.mint}: ${scoreResult.gateReason}`);
+      continue;
+    }
+
+    console.log(`Scored ${candidate.mint}: ${scoreResult.total.toFixed(1)}`);
+
+    if (scoreResult.entryAllowed) {
+      await executeEntry(env, { ...tokenData, symbol: candidate.symbol }, scoreResult);
+    }
+  }
+}
+
+export default {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runScanLoop(env));
+  },
+
+  async fetch(request, env, ctx) {
+    await runScanLoop(env);
+    return new Response("Scan loop executed manually. Check wrangler tail for logs.");
+  },
+};

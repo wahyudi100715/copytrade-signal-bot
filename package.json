@@ -1,13 +1,13 @@
 {
-  "name": "gmgn-bridge",
-  "version": "1.0.0",
-  "description": "Jembatan HTTP kecil antara TokenScanSD dan gmgn-cli",
-  "main": "server.js",
+  "name": "copytrade-signal-bot",
+  "version": "0.1.0",
+  "private": true,
   "scripts": {
-    "start": "node server.js"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
   },
-  "dependencies": {
-    "express": "^4.19.2",
-    "dotenv": "^16.4.5"
+  "devDependencies": {
+    "wrangler": "^3.80.0"
   }
 }

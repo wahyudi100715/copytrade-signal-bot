@@ -1,19 +1,10 @@
-name = "tsd-holder-snapshot"
-main = "worker.js"
-compatibility_date = "2026-01-01"
-compatibility_flags = ["nodejs_compat"]
+name = "copytrade-signal-bot"
+main = "worker/index.js"
+compatibility_date = "2024-09-23"
 
-# Runs every 6 hours. Adjust cron as needed (e.g. "0 */3 * * *" for every 3h).
 [triggers]
-crons = ["0 */6 * * *"]
+crons = ["*/1 * * * *"]
 
-# Reuse an existing KV namespace or create a new one:
-#   npx wrangler kv namespace create TSD_MOMENTUM_KV
-# then paste the returned id below.
 [[kv_namespaces]]
-binding = "TSD_MOMENTUM_KV"
+binding = "BOT_STATE"
 id = "ef449f2aa2eb4afda4262e5db75d1b8d"
-
-# Secrets to set before deploy:
-#   npx wrangler secret put HELIUS_API_KEY
-#   npx wrangler secret put ETHERSCAN_V2_API_KEY
