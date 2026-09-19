@@ -12,7 +12,7 @@ crons = ["0 */6 * * *"]
 # then paste the returned id below.
 [[kv_namespaces]]
 binding = "TSD_MOMENTUM_KV"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id = "ef449f2aa2eb4afda4262e5db75d1b8d"
 
 # Secrets to set before deploy:
 #   npx wrangler secret put HELIUS_API_KEY
