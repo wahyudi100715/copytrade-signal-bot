@@ -312,6 +312,7 @@ async function getCandidateTokens(env, options = {}) {
     maxVol = 100_000,
     pregradLimit = 50,
     geckoLimit = 30,
+    includeGecko = true,
   } = options;
 
   const fetched = [];
@@ -320,10 +321,12 @@ async function getCandidateTokens(env, options = {}) {
   } catch (err) {
     console.error("fetchPumpPregrad failed:", err.message);
   }
-  try {
-    fetched.push(...(await fetchGeckoNewPools(geckoLimit)));
-  } catch (err) {
-    console.error("fetchGeckoNewPools failed:", err.message);
+  if (includeGecko) {
+    try {
+      fetched.push(...(await fetchGeckoNewPools(geckoLimit)));
+    } catch (err) {
+      console.error("fetchGeckoNewPools failed:", err.message);
+    }
   }
 
   let merged = mergePairs(fetched);

@@ -159,12 +159,21 @@ function calculateConfidenceScore(tokenData) {
  * input in the Python version too, not automated scraping).
  */
 async function fetchCandidateTokens(env) {
+  // GeckoTerminal's free tier has been returning HTTP 429 when hit every
+  // single minute (see wrangler tail / dashboard Logs). pump.fun is the
+  // primary source anyway, so only call GeckoTerminal once every 5 minutes
+  // to cut our own contribution to that rate limit and save subrequest
+  // budget for the RugCheck/DexScreener calls that matter more.
+  const currentMinute = new Date().getUTCMinutes();
+  const includeGecko = currentMinute % 5 === 0;
+
   return getCandidateTokens(env, {
     maxAgeMin: 360,
     minMc: 1500,
     maxMc: 500_000,
     minVol: 20_000,
     maxVol: 100_000,
+    includeGecko,
   });
 }
 
@@ -235,14 +244,47 @@ async function notifyTelegram(env, message) {
 
 // ---- Main scan loop -----------------------------------------------------
 
+// Cloudflare Workers cap subrequests per invocation (50 on the free plan).
+// Each candidate that reaches enrichTokenData() costs several subrequests
+// (DexScreener volume/liquidity, RugCheck, KV reads/writes, possibly Helius
+// fallback). Capping how many candidates get that far per cron tick keeps
+// one busy minute from blowing the budget and erroring out the rest.
+const MAX_CANDIDATES_PER_RUN = 8;
+
 async function runScanLoop(env) {
   const candidates = await fetchCandidateTokens(env);
+  const nowSec = Math.floor(Date.now() / 1000);
+  let processed = 0;
 
   for (const candidate of candidates) {
+    if (processed >= MAX_CANDIDATES_PER_RUN) {
+      console.log(`Reached MAX_CANDIDATES_PER_RUN (${MAX_CANDIDATES_PER_RUN}), deferring the rest to next tick`);
+      break;
+    }
+
     const seenKey = `seen:${candidate.mint}`;
     const alreadySeen = await env.BOT_STATE.get(seenKey);
     if (alreadySeen) continue;
 
+    // Cheap age check FIRST — candidate.poolCreatedAt is already in hand
+    // from pairFinder.js, no network call needed. This is the same gate
+    // calculateConfidenceScore() applies, just moved earlier so a stale or
+    // too-fresh candidate never wastes a RugCheck/DexScreener subrequest.
+    const poolAge = nowSec - (candidate.poolCreatedAt || nowSec);
+    if (poolAge < SNIPE_WINDOW_SECONDS) {
+      // Still within the snipe window — don't mark as seen, it may become
+      // eligible on a later tick once enough time has passed.
+      console.log(`Deferred ${candidate.mint}: pool only ${poolAge}s old, below ${SNIPE_WINDOW_SECONDS}s snipe window`);
+      continue;
+    }
+    if (poolAge > SIGNAL_EXPIRY_SECONDS) {
+      // Too old to ever qualify — mark seen so it's not rechecked forever.
+      await env.BOT_STATE.put(seenKey, "1", { expirationTtl: 3600 * 24 });
+      console.log(`Skipped ${candidate.mint} early: pool ${poolAge}s old, past ${SIGNAL_EXPIRY_SECONDS}s signal expiry`);
+      continue;
+    }
+
+    processed++;
     const tokenData = await enrichTokenData(env, candidate);
     const scoreResult = calculateConfidenceScore(tokenData);
 
