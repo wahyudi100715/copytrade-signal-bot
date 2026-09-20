@@ -207,27 +207,47 @@ function applyNewpairFilters(rows, maxAgeMin, minMc, maxMc) {
 
 // ---- fetch_dexscreener_volume_h24 / apply_volume_filter -------------------
 
-async function fetchDexscreenerVolumeH24(mint) {
+async function fetchDexscreenerPairSummary(mint) {
   try {
     const raw = await httpGetJson(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, 15000);
     const pairs = raw.pairs || [];
     if (!pairs.length) return null;
-    const vols = pairs.map((p) => Number((p.volume || {}).h24 || 0));
-    return vols.length ? Math.max(...vols) : null;
+    // pick the pair with the most liquidity, same tie-break TokenScanSD's
+    // scan.js uses in fetchDexScreenerData()
+    const primary = pairs.reduce((best, cur) => {
+      const liq = (cur.liquidity && cur.liquidity.usd) || 0;
+      const bestLiq = (best && best.liquidity && best.liquidity.usd) || 0;
+      return liq > bestLiq ? cur : best;
+    }, pairs[0]);
+    return {
+      volume24h: Number((primary.volume || {}).h24 || 0),
+      liquidityUsd: Number((primary.liquidity || {}).usd || 0),
+    };
   } catch {
     return null;
   }
 }
 
+// Kept for backward compatibility with anything calling the old name directly.
+async function fetchDexscreenerVolumeH24(mint) {
+  const summary = await fetchDexscreenerPairSummary(mint);
+  return summary ? summary.volume24h : null;
+}
+
 async function applyVolumeFilter(rows, minVol, maxVol) {
   if (minVol <= 0 && maxVol <= 0) {
-    for (const row of rows) row.volume_24h = null;
+    for (const row of rows) {
+      row.volume_24h = null;
+      row.liquidity_usd = row.liquidity_usd || 0;
+    }
     return rows;
   }
   const kept = [];
   for (const row of rows) {
-    const vol = await fetchDexscreenerVolumeH24(row.mint);
+    const summary = await fetchDexscreenerPairSummary(row.mint);
+    const vol = summary ? summary.volume24h : null;
     row.volume_24h = vol;
+    row.liquidity_usd = summary ? summary.liquidityUsd : (row.liquidity_usd || 0);
     if (vol === null) continue;
     if (minVol > 0 && vol < minVol) continue;
     if (maxVol > 0 && vol > maxVol) continue;
@@ -322,6 +342,7 @@ async function getCandidateTokens(env, options = {}) {
       // carried through so enrichTokenData() in index.js doesn't need a
       // second DexScreener call just to get what we already fetched here
       volume24hFromDexscreener: row.volume_24h,
+      liquidityUsd: row.liquidity_usd || 0,
     });
   }
   return candidates;

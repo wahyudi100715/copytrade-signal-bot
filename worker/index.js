@@ -12,6 +12,7 @@
  */
 
 import { getCandidateTokens } from "./pairFinder.js";
+import { fetchSecurityData } from "./security.js";
 
 // ---- Tunable parameters (mirrors confidence_signal_scorer.py) ----------
 
@@ -168,19 +169,19 @@ async function fetchCandidateTokens(env) {
 }
 
 /**
- * STILL TODO: holderCount/holderCount15minAgo, liquidityUsd, lpLocked,
- * top10HolderPct, devHolderPct, goplusRiskScore, rugcheckFlag — none of
- * these come from newpair_kol_filter.py, so they're still stubbed here.
- * You already have this logic in TokenScanSD's functions/api/analyze.js
- * (GoPlus + RugCheck calls) — reuse those same calls here, or call that
- * endpoint directly from this Worker since it's already deployed.
+ * Ported from TokenScanSD's functions/api/scan.js (fetchTokenDataSolana's
+ * RugCheck half — GoPlus isn't in scan.js's Solana path, so it isn't here
+ * either; see worker/security.js header for why).
  *
- * volume5minUsd/volumePrior5minUsd need a *rolling* 5-minute comparison,
- * which the h24 figure from pairFinder.js can't give you — that also
- * needs its own data source (e.g. two DexScreener reads 5 minutes apart,
- * cached in KV) rather than being invented from the h24 number here.
+ * STILL TODO: holderCount/holderCount15minAgo, volume5minUsd/
+ * volumePrior5minUsd need a *rolling* comparison across scans (like
+ * replyCount growth in pairFinder.js), which scan.js doesn't provide —
+ * it only returns a snapshot, not history. Left at 0 until a KV-backed
+ * rolling snapshot is added the same way getReplyGrowthSignal() works.
  */
 async function enrichTokenData(env, candidate) {
+  const security = await fetchSecurityData(candidate.mint, env);
+
   return {
     poolCreatedAt: candidate.poolCreatedAt,
     now: Math.floor(Date.now() / 1000),
@@ -190,12 +191,15 @@ async function enrichTokenData(env, candidate) {
     holderCount15minAgo: 0,
     volume5minUsd: 0,
     volumePrior5minUsd: 0,
-    liquidityUsd: 0,
-    lpLocked: false,
-    top10HolderPct: 100,
-    devHolderPct: 100,
-    goplusRiskScore: 0,
-    rugcheckFlag: false,
+    liquidityUsd: candidate.liquidityUsd || 0,
+    lpLocked: security ? !!security.liquidityLocked : false,
+    top10HolderPct: security && security.top10HolderPct !== null ? security.top10HolderPct : 100,
+    devHolderPct: security && security.devHolderPercent !== null ? security.devHolderPercent : 100,
+    // No GoPlus call for Solana in scan.js (see worker/security.js header) —
+    // this slot is repurposed to carry RugCheck's own mint/freeze-authority
+    // -renounced signal instead of leaving it permanently at 0.
+    goplusRiskScore: security && security.ownershipRenounced ? 100 : 0,
+    rugcheckFlag: security ? !!security.hasDangerRisk : false,
   };
 }
 
