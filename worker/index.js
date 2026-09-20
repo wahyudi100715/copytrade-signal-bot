@@ -249,7 +249,7 @@ async function notifyTelegram(env, message) {
 // (DexScreener volume/liquidity, RugCheck, KV reads/writes, possibly Helius
 // fallback). Capping how many candidates get that far per cron tick keeps
 // one busy minute from blowing the budget and erroring out the rest.
-const MAX_CANDIDATES_PER_RUN = 8;
+const MAX_CANDIDATES_PER_RUN = 5;
 
 async function runScanLoop(env) {
   const candidates = await fetchCandidateTokens(env);
