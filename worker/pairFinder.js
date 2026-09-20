@@ -205,7 +205,22 @@ function applyNewpairFilters(rows, maxAgeMin, minMc, maxMc) {
   return kept;
 }
 
-// ---- fetch_dexscreener_volume_h24 / apply_volume_filter -------------------
+// ---- Volume SPIKE detection (replaces the static min/max volume range) --
+//
+// This is the core of the simplified strategy: only tokens with volume
+// ACCELERATING right now, not just tokens that happen to sit in some
+// absolute volume range. DexScreener already gives a 5-minute window
+// (volume.m5) alongside the 1-hour window (volume.h1) for most pairs —
+// no need to build our own rolling snapshot for this one, unlike replies
+// or holders which only come back as flat totals.
+//
+// Spike condition: 5-minute volume is well above what a flat, non-spiking
+// hour would imply (h1 / 12 = expected volume per 5-minute slice). A ratio
+// of 1 means "trading exactly at the hourly average pace"; SPIKE_MULTIPLIER
+// requires meaningfully faster-than-average trading right now.
+
+const SPIKE_MULTIPLIER = 3; // m5 volume must be >= 3x the hourly-average 5-min pace
+const MIN_M5_VOLUME_USD = 300; // floor so near-zero-volume pairs don't produce noisy "infinite" ratios
 
 async function fetchDexscreenerPairSummary(mint) {
   try {
@@ -219,8 +234,11 @@ async function fetchDexscreenerPairSummary(mint) {
       const bestLiq = (best && best.liquidity && best.liquidity.usd) || 0;
       return liq > bestLiq ? cur : best;
     }, pairs[0]);
+    const vol = primary.volume || {};
     return {
-      volume24h: Number((primary.volume || {}).h24 || 0),
+      volume24h: Number(vol.h24 || 0),
+      volumeH1: Number(vol.h1 || 0),
+      volumeM5: Number(vol.m5 || 0),
       liquidityUsd: Number((primary.liquidity || {}).usd || 0),
     };
   } catch {
@@ -234,23 +252,30 @@ async function fetchDexscreenerVolumeH24(mint) {
   return summary ? summary.volume24h : null;
 }
 
-async function applyVolumeFilter(rows, minVol, maxVol) {
-  if (minVol <= 0 && maxVol <= 0) {
-    for (const row of rows) {
-      row.volume_24h = null;
-      row.liquidity_usd = row.liquidity_usd || 0;
-    }
-    return rows;
+function computeVolumeSpike(summary) {
+  if (!summary) return { isSpike: false, ratio: 0 };
+  if (summary.volumeM5 < MIN_M5_VOLUME_USD) return { isSpike: false, ratio: 0 };
+  const expectedPer5min = summary.volumeH1 / 12;
+  if (expectedPer5min <= 0) {
+    // No hourly history yet (brand new pair) but real 5-min volume exists —
+    // treat as a spike since there's nothing to compare against but activity
+    // is clearly happening.
+    return { isSpike: true, ratio: Infinity };
   }
+  const ratio = summary.volumeM5 / expectedPer5min;
+  return { isSpike: ratio >= SPIKE_MULTIPLIER, ratio };
+}
+
+async function applyVolumeSpikeFilter(rows) {
   const kept = [];
   for (const row of rows) {
     const summary = await fetchDexscreenerPairSummary(row.mint);
-    const vol = summary ? summary.volume24h : null;
-    row.volume_24h = vol;
+    const spike = computeVolumeSpike(summary);
+    row.volume_24h = summary ? summary.volume24h : null;
+    row.volume_m5 = summary ? summary.volumeM5 : null;
     row.liquidity_usd = summary ? summary.liquidityUsd : (row.liquidity_usd || 0);
-    if (vol === null) continue;
-    if (minVol > 0 && vol < minVol) continue;
-    if (maxVol > 0 && vol > maxVol) continue;
+    row.volume_spike_ratio = spike.ratio;
+    if (!spike.isSpike) continue;
     kept.push(row);
   }
   return kept;
@@ -300,16 +325,16 @@ async function getReplyGrowthSignal(env, mint, currentReplies) {
 // ---- Orchestration: replaces the empty fetchCandidateTokens() stub --------
 
 /**
- * options mirrors the Python script's CLI args (see main()'s argparse
- * defaults): maxAgeMin, minMc, maxMc, minVol, maxVol.
+ * Simplified strategy (per explicit spec): don't scan every token — only
+ * chase ones showing a real volume spike right now, small market cap, and
+ * a new pool. Safety (RugCheck) is checked AFTER this filter, only for the
+ * few survivors, not for every raw pump.fun listing.
  */
 async function getCandidateTokens(env, options = {}) {
   const {
     maxAgeMin = 360,
     minMc = 1500,
     maxMc = 500_000,
-    minVol = 20_000,
-    maxVol = 100_000,
     pregradLimit = 50,
     geckoLimit = 30,
     includeGecko = true,
@@ -332,25 +357,19 @@ async function getCandidateTokens(env, options = {}) {
   let merged = mergePairs(fetched);
   merged = applyNewpairFilters(merged, maxAgeMin, minMc, maxMc);
 
-  // Cap BEFORE the volume filter, not after — applyVolumeFilter() does one
-  // DexScreener subrequest per row, so the previous placement (after the
-  // filter) let every age/mc-surviving row burn a subrequest first and only
-  // trimmed the leftovers. With pump.fun regularly passing 20-40 rows
-  // through the age/mc filter, that alone was eating most of Cloudflare's
-  // 50-subrequest-per-invocation budget before index.js ever got to call
-  // RugCheck — which is exactly why RugCheck kept failing with
-  // "Too many subrequests by single Worker invocation" even after the
-  // earlier fixes. Capping here bounds pump.fun+gecko(4) + this file's own
-  // DexScreener/KV calls (<= MAX_MERGED_CANDIDATES * 3) so index.js's own
-  // loop (RugCheck, up to MAX_CANDIDATES_PER_RUN candidates) still has
-  // budget left when its turn comes.
-  const MAX_MERGED_CANDIDATES = 10;
+  // Cap BEFORE the DexScreener spike-check loop — each row costs one
+  // subrequest there, so bounding the list first keeps Cloudflare's
+  // 50-subrequest-per-invocation budget from being spent before RugCheck
+  // (called later, in index.js, for the few survivors) gets its turn.
+  const MAX_MERGED_CANDIDATES = 15;
   if (merged.length > MAX_MERGED_CANDIDATES) {
     console.log(`Trimming ${merged.length} merged candidates down to ${MAX_MERGED_CANDIDATES} to stay within subrequest/CPU budget`);
     merged = merged.slice(0, MAX_MERGED_CANDIDATES);
   }
 
-  merged = await applyVolumeFilter(merged, minVol, maxVol);
+  // THE core filter for this strategy: only tokens with volume actually
+  // accelerating right now survive past here.
+  merged = await applyVolumeSpikeFilter(merged);
 
   const candidates = [];
   for (const row of merged) {
@@ -364,6 +383,8 @@ async function getCandidateTokens(env, options = {}) {
       // carried through so enrichTokenData() in index.js doesn't need a
       // second DexScreener call just to get what we already fetched here
       volume24hFromDexscreener: row.volume_24h,
+      volumeM5: row.volume_m5 || 0,
+      volumeSpikeRatio: row.volume_spike_ratio || 0,
       liquidityUsd: row.liquidity_usd || 0,
     });
   }
@@ -377,7 +398,9 @@ export {
   mergePairs,
   applyNewpairFilters,
   fetchDexscreenerVolumeH24,
-  applyVolumeFilter,
+  fetchDexscreenerPairSummary,
+  computeVolumeSpike,
+  applyVolumeSpikeFilter,
   getReplyGrowthSignal,
   getCandidateTokens,
 };

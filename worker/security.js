@@ -113,6 +113,41 @@ async function fetchSolanaTopHoldersViaHelius(mintAddress, env) {
 }
 
 /**
+ * Best-effort holder GROWTH tracking. pump.fun/DexScreener don't expose
+ * holder count at all — RugCheck's `totalHolders` is the only source we
+ * have, and it's only fetched here (for spike-filter survivors), not for
+ * every raw candidate. That means growth can only be measured across
+ * separate RugCheck calls for the SAME mint over time — a real limitation
+ * (first-ever check has nothing to compare against), but still useful:
+ * a token that gets re-evaluated later (e.g. spiked again) will show
+ * whether holders grew since the last time we looked.
+ */
+const HOLDER_GROWTH_MIN_INCREASE = 5;
+
+async function getHolderGrowthSignal(env, mint, currentHolders) {
+  const count = currentHolders || 0;
+  if (!env.BOT_STATE || count <= 0) return { count, growing: false };
+
+  const key = `holders:${mint}`;
+  let growing = false;
+  try {
+    const raw = await env.BOT_STATE.get(key);
+    if (raw) {
+      const prev = JSON.parse(raw);
+      if (count - (prev.count || 0) >= HOLDER_GROWTH_MIN_INCREASE) {
+        growing = true;
+      }
+    }
+    await env.BOT_STATE.put(key, JSON.stringify({ count, ts: Math.floor(Date.now() / 1000) }), {
+      expirationTtl: 3600 * 6,
+    });
+  } catch (err) {
+    console.error(`getHolderGrowthSignal(${mint}) KV error:`, err.message);
+  }
+  return { count, growing };
+}
+
+/**
  * Combined entry point for index.js's enrichTokenData(). Mirrors
  * scan.js's fetchTokenDataSolana(), minus the DexScreener call (pairFinder.js
  * already fetched volume/liquidity for the candidate, no need to fetch twice).
@@ -131,6 +166,9 @@ async function fetchSecurityData(mint, env) {
         rug.top10HolderPct = fallback.top10Pct;
       }
     }
+    const holderGrowth = await getHolderGrowthSignal(env, mint, rug.totalHolders);
+    rug.holderCount = holderGrowth.count;
+    rug.holderCountGrowing = holderGrowth.growing;
     return rug;
   } catch (err) {
     console.error(`fetchSecurityData(${mint}) failed:`, err.message);
@@ -138,4 +176,4 @@ async function fetchSecurityData(mint, env) {
   }
 }
 
-export { fetchRugcheckData, fetchSolanaTopHoldersViaHelius, fetchSecurityData };
+export { fetchRugcheckData, fetchSolanaTopHoldersViaHelius, getHolderGrowthSignal, fetchSecurityData };

@@ -46,29 +46,21 @@ function socialScore(d) {
   return clip(base + growthBonus);
 }
 
+// Momentum is now built directly on the spike/growth signals the
+// simplified strategy asks for: a real volume spike (ratio vs the hourly
+// average pace, computed in pairFinder.js) plus holder count actually
+// increasing (best-effort, from RugCheck — see security.js's
+// getHolderGrowthSignal for the "no history on first check" caveat).
+const SPIKE_RATIO_FOR_FULL_MOMENTUM_SCORE = 10; // ratio >= this maps to a full 1.0 volume-signal
+
 function momentumScore(d) {
-  const volNow = d.volume5minUsd || 0;
-  const volPrev = d.volumePrior5minUsd || 0;
+  const ratio = d.volumeSpikeRatio || 0;
+  const volSignal = Number.isFinite(ratio) ? clip(ratio / SPIKE_RATIO_FOR_FULL_MOMENTUM_SCORE) : 1.0;
+
   const holdersNow = d.holderCount || 0;
-  const holdersPrev = d.holderCount15minAgo || 0;
+  const holderSignal = holdersNow > 0 ? (d.holderCountGrowing ? 1.0 : 0.4) : 0.0;
 
-  let volSignal;
-  if (volPrev <= 0) {
-    volSignal = volNow > 0 ? 0.5 : 0.0;
-  } else {
-    const ratio = volNow / volPrev;
-    volSignal = clip((ratio - 1.0) / 1.0);
-  }
-
-  let holderSignal;
-  if (holdersPrev <= 0) {
-    holderSignal = holdersNow > 0 ? 0.5 : 0.0;
-  } else {
-    const growth = (holdersNow - holdersPrev) / holdersPrev;
-    holderSignal = clip(growth / 0.20);
-  }
-
-  return clip(0.5 * volSignal + 0.5 * holderSignal);
+  return clip(0.6 * volSignal + 0.4 * holderSignal);
 }
 
 function safetyScore(d) {
@@ -167,12 +159,14 @@ async function fetchCandidateTokens(env) {
   const currentMinute = new Date().getUTCMinutes();
   const includeGecko = currentMinute % 5 === 0;
 
+  // Simplified per spec: no static volume range anymore — pairFinder.js's
+  // applyVolumeSpikeFilter() only lets through tokens with volume actually
+  // accelerating right now (see SPIKE_MULTIPLIER there). Age/mc still gate
+  // "new pool, still small" as asked.
   return getCandidateTokens(env, {
     maxAgeMin: 360,
     minMc: 1500,
     maxMc: 500_000,
-    minVol: 20_000,
-    maxVol: 100_000,
     includeGecko,
   });
 }
@@ -182,11 +176,10 @@ async function fetchCandidateTokens(env) {
  * RugCheck half — GoPlus isn't in scan.js's Solana path, so it isn't here
  * either; see worker/security.js header for why).
  *
- * STILL TODO: holderCount/holderCount15minAgo, volume5minUsd/
- * volumePrior5minUsd need a *rolling* comparison across scans (like
- * replyCount growth in pairFinder.js), which scan.js doesn't provide —
- * it only returns a snapshot, not history. Left at 0 until a KV-backed
- * rolling snapshot is added the same way getReplyGrowthSignal() works.
+ * holderCount/holderCountGrowing now come from RugCheck via
+ * security.js's getHolderGrowthSignal() (best-effort — see that file's
+ * comment on the cold-start limitation). volume spike data comes straight
+ * from the candidate (pairFinder.js already computed it before this point).
  */
 async function enrichTokenData(env, candidate) {
   const security = await fetchSecurityData(candidate.mint, env);
@@ -196,10 +189,9 @@ async function enrichTokenData(env, candidate) {
     now: Math.floor(Date.now() / 1000),
     replyCount: candidate.replyCount || 0,
     replyCountGrowing: candidate.replyCountGrowing || false,
-    holderCount: 0,
-    holderCount15minAgo: 0,
-    volume5minUsd: 0,
-    volumePrior5minUsd: 0,
+    volumeSpikeRatio: candidate.volumeSpikeRatio || 0,
+    holderCount: security ? security.holderCount || 0 : 0,
+    holderCountGrowing: security ? !!security.holderCountGrowing : false,
     liquidityUsd: candidate.liquidityUsd || 0,
     lpLocked: security ? !!security.liquidityLocked : false,
     top10HolderPct: security && security.top10HolderPct !== null ? security.top10HolderPct : 100,
