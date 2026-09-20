@@ -333,6 +333,18 @@ async function getCandidateTokens(env, options = {}) {
   merged = applyNewpairFilters(merged, maxAgeMin, minMc, maxMc);
   merged = await applyVolumeFilter(merged, minVol, maxVol);
 
+  // Safety cap independent of the volume filter: if minVol/maxVol are ever
+  // loosened (0/0 disables the filter entirely) or pump.fun just has an
+  // unusually busy window, this keeps the getReplyGrowthSignal() loop below
+  // from doing unbounded KV reads/writes in one invocation and hitting
+  // Cloudflare's CPU-time limit (outcome: "exceededCpu") — which is exactly
+  // what happened when the volume filter was briefly disabled for testing.
+  const MAX_MERGED_CANDIDATES = 20;
+  if (merged.length > MAX_MERGED_CANDIDATES) {
+    console.log(`Trimming ${merged.length} merged candidates down to ${MAX_MERGED_CANDIDATES} to stay within CPU budget`);
+    merged = merged.slice(0, MAX_MERGED_CANDIDATES);
+  }
+
   const candidates = [];
   for (const row of merged) {
     const reply = await getReplyGrowthSignal(env, row.mint, row.replies);
