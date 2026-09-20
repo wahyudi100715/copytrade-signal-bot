@@ -219,7 +219,7 @@ function applyNewpairFilters(rows, maxAgeMin, minMc, maxMc) {
 // of 1 means "trading exactly at the hourly average pace"; SPIKE_MULTIPLIER
 // requires meaningfully faster-than-average trading right now.
 
-const SPIKE_MULTIPLIER = 3; // m5 volume must be >= 3x the hourly-average 5-min pace
+const SPIKE_MULTIPLIER = 2; // m5 volume must be >= 2x the hourly-average 5-min pace
 const MIN_M5_VOLUME_USD = 300; // floor so near-zero-volume pairs don't produce noisy "infinite" ratios
 
 async function fetchDexscreenerPairSummary(mint) {
