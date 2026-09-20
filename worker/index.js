@@ -222,15 +222,22 @@ async function executeEntry(env, tokenData, scoreResult) {
 }
 
 async function notifyTelegram(env, message) {
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    console.log("notifyTelegram skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set");
+    return;
+  }
   try {
-    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: message }),
     });
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(`Telegram sendMessage failed: HTTP ${res.status} - ${body}`);
+    }
   } catch (err) {
-    console.error("Telegram notify failed:", err);
+    console.error("Telegram notify failed:", err.message);
   }
 }
 
@@ -289,6 +296,22 @@ async function runScanLoop(env) {
     }
 
     console.log(`Scored ${candidate.mint}: ${scoreResult.total.toFixed(1)}`);
+
+    // Reminder ping for EVERY candidate that made it this far (passed the
+    // volume-spike filter + RugCheck), not just ones that hit the
+    // auto-entry threshold — entryAllowed is rare by design, so without
+    // this you'd almost never hear from the bot even when it's working.
+    await notifyTelegram(
+      env,
+      `🔔 Candidate lolos filter\n` +
+        `Token: ${candidate.symbol || "?"} (${candidate.mint})\n` +
+        `Score: ${scoreResult.total.toFixed(1)}/100 (butuh ≥70 buat auto-entry)\n` +
+        `Volume spike: ${candidate.volumeSpikeRatio}x\n` +
+        `Reply count: ${candidate.replyCount}\n` +
+        `Top10 holder: ${tokenData.top10HolderPct}% | Dev: ${tokenData.devHolderPct}%\n` +
+        `LP locked: ${tokenData.lpLocked} | Danger flag: ${tokenData.rugcheckFlag}\n` +
+        `https://dexscreener.com/solana/${candidate.mint}`
+    );
 
     if (scoreResult.entryAllowed) {
       await executeEntry(env, { ...tokenData, symbol: candidate.symbol }, scoreResult);
